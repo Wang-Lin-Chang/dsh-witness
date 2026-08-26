@@ -1,6 +1,6 @@
 {
   "name": "dsh-witness",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Witness jobs for DeepSeek Harness: crash-surviving background tasks where the filesystem is the source of truth - cross-restart adoption, autopsy reports, sandboxed execution, event sourcing. Tested on Windows 11 NTFS.",
   "type": "module",
   "main": "lib/WitnessJobRegistry.js",

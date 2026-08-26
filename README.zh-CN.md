@@ -70,7 +70,7 @@ jobs/
 ## 快速开始 / Quick start
 
 ```sh
-dsh plugin --profile <name> add "github:Wang-Lin-Chang/dsh-witness#v0.2.0"
+dsh plugin --profile <name> add "github:Wang-Lin-Chang/dsh-witness#v0.2.1"
 ```
 
 仓库提交了编译产物（`lib/`），git 安装无需构建步骤。

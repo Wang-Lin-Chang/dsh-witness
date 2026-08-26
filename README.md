@@ -68,7 +68,7 @@ jobs/
 ## Quick start
 
 ```sh
-dsh plugin --profile <name> add "github:Wang-Lin-Chang/dsh-witness#v0.2.0"
+dsh plugin --profile <name> add "github:Wang-Lin-Chang/dsh-witness#v0.2.1"
 ```
 
 The repo ships compiled output (`lib/`), so git installs need no build step.
