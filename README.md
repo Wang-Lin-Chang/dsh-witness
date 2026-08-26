@@ -1,132 +1,130 @@
 # dsh-witness
 
 > Crash-surviving background jobs for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), where **the filesystem is the source of truth**. Cross-restart adoption, autopsy reports, sandboxed execution, event sourcing — battle-tested on Windows 11 NTFS.
->
-> 给 DeepSeek Harness 的崩溃存活后台任务：**文件系统即真相源**。跨重启收养、尸检报告、沙箱执行、事件溯源——Windows 11 NTFS 实测。
+
+中文版见 [README.zh-CN.md](./README.zh-CN.md)。
 
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![ci](https://github.com/Wang-Lin-Chang/dsh-witness/actions/workflows/ci.yml/badge.svg)](https://github.com/Wang-Lin-Chang/dsh-witness/actions/workflows/ci.yml)
 [![topic: dsh-plugin](https://img.shields.io/badge/topic-dsh--plugin-4d6bfe)](https://github.com/topics/dsh-plugin)
 [![topic: dsh](https://img.shields.io/badge/topic-dsh-4d6bfe)](https://github.com/topics/dsh)
 
-## 为什么存在 / Why this exists
+## Why this exists
 
-Harness 内核自带的后台 *jobs* 是 fire-and-forget 工具执行（能读输出、能杀，不能对话、不能跨崩溃收养）。真实环境里的长程会话踩过这些公开的坑：
+The harness's built-in background *jobs* are fire-and-forget tool executions (readable output, killable, but no conversation and no cross-crash adoption). Long-running sessions in real environments hit these public pain points:
 
-| 公开的痛点 | dsh-witness 的答案 |
+| Public pain point | dsh-witness's answer |
 |---|---|
-| Force-kill 丢弃未刷盘的 write-behind 尾部（[#483](https://github.com/deepseek-ai/deepseek-harness/discussions/483)）| **零缓冲。** 每次状态转移立即落盘——目录结构本身就是状态机。 |
-| 一条损坏的日志事件让会话永久死亡、无修复路径（[#1593](https://github.com/deepseek-ai/deepseek-harness/discussions/1593)）| **双真相源。** 目录=真相；SQLite=可重建的只读索引缓存（游标+mtime 失效）。缓存坏了永远不挡恢复——从目录重建即可。 |
-| 两个任务挤在一个文件夹互相覆盖；40 分钟长跑交付坏产物（第三方实测报告）| **每任务一个隔离目录** + O_EXCL 锁 + 每任务沙箱化 cwd。 |
-| "恢复意味着知道最后完成的步骤和证明输出的证据"（专家建议）| **尸检报告。** 每任务 `autopsy.json`：死因、主证据、判决、死因代码。 |
-| 调度任务静默失败、无审查路径 | **事件溯源。** `events/*.jsonl` 记录每个任务的 started/output/done/adopted/tampered。 |
+| Force-kill drops the unflushed write-behind tail ([#483](https://github.com/deepseek-ai/deepseek-harness/discussions/483)) | **Zero buffering.** Every state transition lands on disk immediately — the directory structure itself is the state machine. |
+| One corrupted log event kills a session permanently, with no repair path ([#1593](https://github.com/deepseek-ai/deepseek-harness/discussions/1593)) | **Two sources of truth.** Directory = truth; SQLite = a rebuildable read-only index cache (cursor + mtime invalidation). A broken cache never blocks recovery — rebuild it from the directory. |
+| Two jobs sharing one folder overwrite each other; a 40-minute run delivers a broken artifact (third-party measured report) | **One isolated directory per job** + O_EXCL lock + sandboxed cwd per job. |
+| "Recovery means knowing the last completed step and the evidence proving the output" (expert advice) | **Autopsy reports.** Per-job `autopsy.json`: cause of death, primary evidence, verdict, death code. |
+| Scheduled jobs fail silently with no review path | **Event sourcing.** `events/*.jsonl` records started/output/done/adopted/tampered for every job. |
 
-## 谁适合用它 / Who is this for
+## Who is this for
 
-- 在 DeepSeek Harness 里跑**长后台任务**（几分钟以上的构建、批处理、数据搬运），被"会话一死任务就死"坑过的人；
-- 被 **force-kill 丢输出尾部**坑过的人——输出游标续读，跨重启不重不漏；
-- 需要事后知道**任务到底怎么死的**的人——`autopsy.json` 尸检：死因、主证据、判决、死因代码；
-- 需要**防伪造留痕**的人——任务自救改证据会被判 `tampered`，而不是被默默信任。
+- People who run **long background jobs** on DeepSeek Harness (multi-minute builds, batch processing, data moves) and have been bitten by "session dies, job dies";
+- People bitten by **force-kill output-tail loss** — cursor-based incremental reads, no repeats or gaps across restarts;
+- People who need to know **how a job actually died** — `autopsy.json`: cause, primary evidence, verdict, death code;
+- People who need **tamper-evident trails** — a job that tampers with its own evidence is judged `tampered`, not silently trusted.
 
-**不适合**：几秒就结束的短命令——官方内置 jobs 已经够用，不必上这套目录协议。
+**Not for**: one-shot quick commands — the built-in jobs suffice there.
 
-> Runs long background jobs that must survive session/process death, with an autopsy trail instead of silent failure. Not for one-shot quick commands — the built-in jobs suffice there.
+## The truth source: job directory anatomy
 
-## 真相源：任务目录解剖 / The truth source
-
-每个任务一个目录，**状态就是目录结构的函数**：
+One directory per job — **state is a function of the directory structure**:
 
 ```
 jobs/
-└── pwsh-1/                      # 一个任务 = 一个目录
+└── pwsh-1/                      # one job = one directory
     ├── state/
-    │   ├── running              # 五态标记（任一时刻恰一个为主）
+    │   ├── running              # five-state markers (exactly one active at a time)
     │   ├── stopping
-    │   ├── orphaned             # 崩溃残留（收养判定现场）
-    │   ├── adopted              # 新会话已收养
-    │   └── done                 # 终态（内容 = 退出码）
-    ├── lock                     # O_EXCL 协调锁，内容 = pid:startSec
-    ├── spec.json                # 任务规格（kind/label/startedAt）
-    ├── out.log                  # 输出（游标续读）
-    ├── exit.txt                 # 退出协议（EXIT:<code>）
-    ├── autopsy.json             # 尸检报告（终态时生成）
-    └── events/                  # 事件溯源
+    │   ├── orphaned             # crash residue (adoption adjudication site)
+    │   ├── adopted              # adopted by a new session
+    │   └── done                 # terminal state (content = exit code)
+    ├── lock                     # O_EXCL coordination lock, content = pid:startSec
+    ├── spec.json                # job spec (kind/label/startedAt)
+    ├── out.log                  # output (cursor-based incremental reads)
+    ├── exit.txt                 # exit protocol (EXIT:<code>)
+    ├── autopsy.json             # autopsy report (generated at terminal state)
+    └── events/                  # event sourcing
         ├── 0001-started.jsonl
         ├── 0002-output.jsonl
         └── 0003-done.jsonl
 ```
 
-**三证据收养判定**：lock 内容（`pid:startSec`）+ 进程存活 + 进程启动时间比对（防 PID 复用）。任何时刻 kill -9，重启后新实例扫目录即可收养或结案。
+**Three-evidence adoption adjudication**: lock content (`pid:startSec`) + process liveness + process start-time comparison (PID-reuse guard). Kill -9 at any moment; after restart, a new instance scans the directory and adopts or closes each job.
 
-## 你能得到什么 / What you get
+## What you get
 
-- **跨重启收养**——状态机活在目录结构里。任何 force-kill 后，新的 registry 实例用三证据收养或终结每个任务。
-- **尸检报告**——每个终态任务拿到 `autopsy.json`（死因、主证据、判决、死因代码 D-01…D-09）+ output 摘要事件。
-- **沙箱执行**——Windows NTFS ACL 限制在任务 spawn **之前**应用：证据文件的覆盖/追加/改名/删除/伪造全被挡；守卫句柄删除 lock 作为完成信号；留痕检测（lock 内容+ACL 结构校验）把自救伪造标记为 `tampered`（`EXIT:-999`）。
-- **游标续读输出**——`read(id)` 只返回新字节；游标跨重启持久，长输出不重不漏。
-- **并发收养安全**——50 个独立进程竞争终结同一个孤儿，恰好产生一个终态（幂等 finalize + 原子状态标记）。
-- **`wait`/`close` 生命周期**——轮询到终态；干净停掉监控定时器。
+- **Cross-restart adoption** — the state machine lives in the directory structure. After any force-kill, a new registry instance adopts or finalizes each job via the three-evidence rule.
+- **Autopsy reports** — every terminal job gets `autopsy.json` (cause, primary evidence, verdict, death code D-01…D-09) plus output-summary events.
+- **Sandboxed execution** — Windows NTFS ACLs are applied **before** the job spawns: overwrite/append/rename/delete/forge of evidence files are all blocked; the guard handle's lock deletion is the completion signal; tamper detection (lock content + ACL structure checks) marks self-rescue forgeries as `tampered` (`EXIT:-999`).
+- **Cursor-based incremental output** — `read(id)` returns only new bytes; the cursor persists across restarts; long outputs are read without repeats or gaps.
+- **Concurrent adoption safety** — 50 independent processes racing to finalize one orphan produce exactly one terminal state (idempotent finalize + atomic state marker).
+- **`wait`/`close` lifecycle** — poll to terminal state; cleanly stop the monitor timer.
 
-## 快速开始 / Quick start
+## Quick start
 
 ```sh
 dsh plugin --profile <name> add "github:Wang-Lin-Chang/dsh-witness#v0.2.0"
 ```
 
-仓库提交了编译产物（`lib/`），git 安装无需构建步骤。
+The repo ships compiled output (`lib/`), so git installs need no build step.
 
 ```ts
 import { WitnessJobRegistry } from 'dsh-witness'
 
 const reg = new WitnessJobRegistry(ctx, {
-  jobsRoot: './data/witness-jobs',        // 真相源：每任务一个目录
-  indexDbPath: './data/witness-index.db', // 可重建索引缓存
-  adoptMonitorMs: 30000,                  // 收养扫描间隔
+  jobsRoot: './data/witness-jobs',        // truth source: one directory per job
+  indexDbPath: './data/witness-index.db', // rebuildable index cache
+  adoptMonitorMs: 30000,                  // adoption scan interval
 })
 
 const id = reg.start({ kind: 'pwsh', label: 'long-task', command: 'Start-Sleep 60; Write-Output done' })
 const snap = await reg.wait(id, 120000)   // → completed | failed | tampered
-const output = reg.read(id)               // 游标式增量读
-reg.close()                               // 停监控定时器
+const output = reg.read(id)               // cursor-based incremental read
+reg.close()                               // stop the monitor timer
 ```
 
-## 验收证据 / Acceptance evidence
+## Acceptance evidence
 
-`test/witness-final-test.ts` —— 12 场景 / 34 断言，连跑稳定全绿。实测环境：**Windows 11 Pro · Node 25.8 · PowerShell 5.1**。
+`test/witness-final-test.ts` — 12 scenarios / 34 assertions, stable green on repeated runs. Measured on **Windows 11 Pro · Node 25.8 · PowerShell 5.1**.
 
-| 类别 | 场景 | 断言 |
+| Category | Scenario | Assertions |
 |---|---|---|
-| 持久化 A | 重启存活 / 僵尸恢复（kill -9）/ 输出游标续读 / ID 不冲突 | 4 项 |
-| 收养协调 B | 50 进程 O_EXCL 竞争恰一终态 / 跨会话收养 / 静默任务保护 / PID 复用防护 | 4 项 |
-| 事件溯源 C | 事件日志完整有序 / 尸检报告生成 | 2 项 |
-| 沙箱边界 D | 防覆盖 / 防删 | 2 项 |
+| Persistence A | Survives restart / zombie recovery (kill -9) / cursor-based output read / ID collision-free | 4 |
+| Adoption coordination B | 50-process O_EXCL race yields exactly one terminal state / cross-session adoption / silent-job protection / PID-reuse guard | 4 |
+| Event sourcing C | Event log complete and ordered / autopsy report generated | 2 |
+| Sandbox boundary D | Overwrite-proof / delete-proof | 2 |
 
-自己跑：`node --experimental-strip-types test/witness-final-test.ts`
+Run it yourself: `node --experimental-strip-types test/witness-final-test.ts`
 
-## 与官方 jobs 的关系 / vs. the built-in jobs
+## vs. the built-in jobs
 
-| | 官方 jobs | dsh-witness |
+| | Built-in jobs | dsh-witness |
 |---|---|---|
-| 崩溃后 | 靠会话持久化（write-behind 有丢尾窗口）| 目录结构即真相，kill -9 后收养续命 |
-| 终态证据 | 无 | autopsy.json 尸检 + 事件溯源 |
-| 任务隔离 | 无目录级隔离 | 每任务独立目录+锁+沙箱 |
-| 输出读 | 整体读 | 游标增量续读（跨重启） |
-| 对话/引导 | 不能 | 不能（v0）——对话式后台 agent 是 dsh-anchor 的领地 |
+| After a crash | Session persistence (write-behind has a tail-loss window) | Directory structure is the truth; adoption continues after kill -9 |
+| Terminal evidence | None | autopsy.json + event sourcing |
+| Job isolation | No directory-level isolation | One directory per job + lock + sandbox |
+| Output reads | Whole-output read | Cursor-based incremental reads (across restarts) |
+| Conversation/guidance | No | No (v0) — conversational background agents are dsh-anchor's domain |
 
-## 诚实边界 / Honest boundaries
+## Honest boundaries
 
-- **Windows-first。** 实测于 Windows 11 NTFS + PowerShell 5.1 + Node 25.8。Linux/macOS 需要移植：锁协议（O_EXCL+startSec）、沙箱（ACL→其他机制）、runner（detached node+PowerShell）目前都是 Windows 专属。**未实测的平台不声称支持。**
-- **任意代码自救超出 ACL 层能力**——任务加载原生代码（P/Invoke）可以以文件属主身份自救 ACL。留痕检测把这种伪造变成可见的 `tampered` 判决而不是默默信任；任意代码层的完全限制是受限 token 的活（见官方 Harness 沙箱配方）。
-- 任务永远可以毁掉自己的输出——那只会伤到它自己，并且证据链全程可见。
+- **Windows-first.** Measured on Windows 11 NTFS + PowerShell 5.1 + Node 25.8. Linux/macOS needs porting: the lock protocol (O_EXCL+startSec), the sandbox (ACL → other mechanisms), and the runner (detached node + PowerShell) are all Windows-specific today. **Untested platforms are not claimed.**
+- **Arbitrary-code self-rescue is beyond the ACL layer** — a job that loads native code (P/Invoke) can rescue its own ACLs as the file owner. Tamper detection turns such forgery into a visible `tampered` verdict instead of silent trust; fully restricting arbitrary code is restricted-token territory (see the official harness sandbox recipes).
+- A job can always destroy its own output — that only hurts itself, and the evidence trail stays visible end to end.
 
-## 开发 / Development
+## Development
 
 ```sh
-npm run build   # tsc 编译 src → lib
-npm test        # 运行 12 项验收（node --experimental-strip-types）
+npm run build   # tsc: src → lib
+npm test        # 12 acceptance scenarios (node --experimental-strip-types)
 ```
 
-要求：Node ≥ 22.5（`node:sqlite`，实测 25.8）、Windows PowerShell 5.1。
+Requires: Node ≥ 22.5 (`node:sqlite`, measured on 25.8), Windows PowerShell 5.1.
 
 ## License
 
