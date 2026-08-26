@@ -10,7 +10,7 @@
 //   · lock 核心防护（C5-readonly-denyWA）：打破继承 + allow 读位含 ReadPermissions + deny WriteAttributes + 只读
 //     —— 实测铁证：4/4 删除路径全挡（PowerShell 强删 / node unlink / node rmSync force / cmd del /f），
 //        覆盖/追加/清只读全挡；allow 含 ReadPermissions 保证任务/Witness 读不伤
-//   · 守卫（open-before-deny 终极形态）：deny 前 P/Invoke 开 lock 的 GENERIC_ALL 句柄，
+//   · 守卫（open-before-deny 最终形态）：deny 前 P/Invoke 开 lock 的 GENERIC_ALL 句柄，
 //     正常退出经句柄 SetFileInformationByHandle(FileDispositionInfo=4) 删除 lock（完成信号）；
 //     runner 崩溃 → 守卫退出不删（lock 残留，收养判定可读）
 //   · 读 EPERM 悬案闭合（实测判决）：守卫循环用 `$sig -ne ''` 判定，

@@ -11,7 +11,7 @@
 
 ## 为什么存在 / Why this exists
 
-Harness 内核自带的后台 *jobs* 是 fire-and-forget 工具执行（能读输出、能杀，不能对话、不能跨崩溃收养）。真实世界里的长程会话踩过这些公开的坑：
+Harness 内核自带的后台 *jobs* 是 fire-and-forget 工具执行（能读输出、能杀，不能对话、不能跨崩溃收养）。真实环境里的长程会话踩过这些公开的坑：
 
 | 公开的痛点 | dsh-witness 的答案 |
 |---|---|
